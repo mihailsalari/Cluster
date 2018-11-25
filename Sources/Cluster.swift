@@ -124,7 +124,11 @@ open class ClusterManager {
      The objects in this array must adopt the MKAnnotation protocol. If no annotations are associated with the cluster manager, the value of this property is an empty array.
      */
     open var annotations: [MKAnnotation] {
-        return tree.annotations(in: .world)
+        var result = [MKAnnotation]()
+        concurrentQueue.sync {
+            result = tree.annotations(in: .world)
+        }
+        return result
     }
     
     /**
@@ -139,9 +143,13 @@ open class ClusterManager {
         return visibleAnnotations.reduce([MKAnnotation](), { $0 + (($1 as? ClusterAnnotation)?.annotations ?? [$1]) })
     }
     
-    open var queue = OperationQueue.serial
+//    open var queue = OperationQueue.serial
+    public let concurrentQueue = DispatchQueue(label: "concurrentQueue", attributes: .concurrent)
+    var tasks = [DispatchWorkItem]()
     
     open weak var delegate: ClusterManagerDelegate?
+    
+    var mutex = pthread_mutex_t()
     
     public init() {}
     
@@ -152,8 +160,11 @@ open class ClusterManager {
         - annotation: An annotation object. The object must conform to the MKAnnotation protocol.
      */
     open func add(_ annotation: MKAnnotation) {
-        queue.cancelAllOperations()
-        tree.add(annotation)
+//        queue.cancelAllOperations()
+        tasks.forEach { $0.cancel() }
+        concurrentQueue.async(flags: .barrier) { [weak self] in
+            self?.tree.add(annotation)
+        }
     }
     
     /**
@@ -175,8 +186,11 @@ open class ClusterManager {
         - annotation: An annotation object. The object must conform to the MKAnnotation protocol.
      */
     open func remove(_ annotation: MKAnnotation) {
-        queue.cancelAllOperations()
-        tree.remove(annotation)
+//        queue.cancelAllOperations()
+        tasks.forEach { $0.cancel() }
+        concurrentQueue.async(flags: .barrier) { [weak self] in
+            self?.tree.remove(annotation)
+        }
     }
     
     /**
@@ -195,8 +209,11 @@ open class ClusterManager {
      Removes all the annotation objects from the cluster manager.
      */
     open func removeAll() {
-        queue.cancelAllOperations()
-        tree = QuadTree(rect: .world)
+//        queue.cancelAllOperations()
+        tasks.forEach { $0.cancel() }
+        concurrentQueue.async(flags: .barrier) { [weak self] in
+            self?.tree = QuadTree(rect: .world)
+        }
     }
     
     /**
@@ -223,11 +240,13 @@ open class ClusterManager {
         let visibleMapRect = mapView.visibleMapRect
         let visibleMapRectWidth = visibleMapRect.size.width
         let zoomScale = Double(mapBounds.width) / visibleMapRectWidth
-        queue.cancelAllOperations()
-        queue.addBlockOperation { [weak self, weak mapView] operation in
+//        queue.cancelAllOperations()
+//        queue.addBlockOperation { [weak self, weak mapView] operation in
+        tasks.forEach { $0.cancel() }
+        let task = DispatchWorkItem(flags: .barrier) { [weak self, weak mapView] in
             guard let self = self, let mapView = mapView else { return completion(false) }
             autoreleasepool { () -> Void in
-                let (toAdd, toRemove) = self.clusteredAnnotations(zoomScale: zoomScale, visibleMapRect: visibleMapRect, operation: operation)
+                let (toAdd, toRemove) = self.clusteredAnnotations(zoomScale: zoomScale, visibleMapRect: visibleMapRect)
                 DispatchQueue.main.async { [weak self, weak mapView] in
                     guard let self = self, let mapView = mapView else { return completion(false) }
                     self.display(mapView: mapView, toAdd: toAdd, toRemove: toRemove)
@@ -235,16 +254,16 @@ open class ClusterManager {
                 }
             }
         }
+        concurrentQueue.async(execute: task)
+        tasks.append(task)
     }
     
-    open func clusteredAnnotations(zoomScale: Double, visibleMapRect: MKMapRect, operation: Operation? = nil) -> (toAdd: [MKAnnotation], toRemove: [MKAnnotation]) {
-        var isCancelled: Bool { return operation?.isCancelled ?? false }
-        
-        guard !isCancelled else { return (toAdd: [], toRemove: []) }
-        
+    open func clusteredAnnotations(zoomScale: Double, visibleMapRect: MKMapRect) -> (toAdd: [MKAnnotation], toRemove: [MKAnnotation]) {
         let mapRects = self.mapRects(zoomScale: zoomScale, visibleMapRect: visibleMapRect)
         
         var allAnnotations = [MKAnnotation]()
+        
+        pthread_mutex_lock(&mutex)
         
         for mapRect in mapRects {
             var totalLatitude: Double = 0
@@ -303,7 +322,7 @@ open class ClusterManager {
             }
         }
         
-        guard !isCancelled else { return (toAdd: [], toRemove: []) }
+        pthread_mutex_unlock(&mutex)
         
         let before = visibleAnnotations
         let after = allAnnotations
@@ -369,3 +388,17 @@ open class ClusterManager {
     }
     
 }
+
+//func synchronized<T>(_ lock: Any, execute: () -> T) -> T {
+//    objc_sync_enter(lock)
+//    defer { objc_sync_exit(lock) }
+//    return execute()
+//}
+
+//extension PThreadMutex {
+//    func sync<R>(execute: () -> R) -> R {
+//        pthread_mutex_lock(&unsafeMutex)
+//        defer { pthread_mutex_unlock(&unsafeMutex) }
+//        return execute()
+//    }
+//}

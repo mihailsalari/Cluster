@@ -244,13 +244,17 @@ extension ClusterManager {
     }
     
     func clusteredAnnotations(zoomScale: Double, visibleMapRect: MKMapRect, completion: @escaping (Bool) -> Void) {
-        queue.cancelAllOperations()
-        queue.addBlockOperation { [weak self] operation in
+//        queue.cancelAllOperations()
+//        queue.addBlockOperation { [weak self] operation in
+        tasks.forEach { $0.cancel() }
+        var task: DispatchWorkItem!
+        task = DispatchWorkItem(flags: .barrier) { [weak self] in
             guard let self = self else { return }
-            _ = self.clusteredAnnotations(zoomScale: zoomScale, visibleMapRect: visibleMapRect, operation: operation)
+            _ = self.clusteredAnnotations(zoomScale: zoomScale, visibleMapRect: visibleMapRect)
             DispatchQueue.main.async {
-                completion(!operation.isCancelled)
+                completion(!task.isCancelled)
             }
         }
+        concurrentQueue.async(execute: task)
     }
 }
