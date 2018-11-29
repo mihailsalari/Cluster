@@ -149,8 +149,6 @@ open class ClusterManager {
     
     open weak var delegate: ClusterManagerDelegate?
     
-    var mutex = pthread_mutex_t()
-    
     public init() {}
     
     /**
@@ -258,9 +256,32 @@ open class ClusterManager {
         tasks.append(task)
     }
     
-    open func clusteredAnnotations(zoomScale: Double, visibleMapRect: MKMapRect) -> (toAdd: [MKAnnotation], toRemove: [MKAnnotation]) {
+    func clusteredAnnotations(zoomScale: Double, visibleMapRect: MKMapRect) -> (toAdd: [MKAnnotation], toRemove: [MKAnnotation]) {
+        let zoomLevel = zoomScale.zoomLevel
         let mapRects = self.mapRects(zoomScale: zoomScale, visibleMapRect: visibleMapRect)
         
+        let allAnnotations = clusteredAnnotations(tree: tree, mapRects: mapRects, zoomLevel: zoomLevel)
+        
+        let before = visibleAnnotations
+        let after = allAnnotations
+        
+        var toRemove = before.subtracted(after)
+        let toAdd = after.subtracted(before)
+        
+        if !shouldRemoveInvisibleAnnotations {
+            let nonRemoving = toRemove.filter { !visibleMapRect.contains($0.coordinate) }
+            toRemove.subtract(nonRemoving)
+        }
+        
+        visibleAnnotations.subtract(toRemove)
+        visibleAnnotations.add(toAdd)
+        
+        return (toAdd: toAdd, toRemove: toRemove)
+    }
+    
+    var mutex = pthread_mutex_t()
+    
+    func clusteredAnnotations(tree: QuadTree, mapRects: [MKMapRect], zoomLevel: Double) -> [MKAnnotation] {
         var allAnnotations = [MKAnnotation]()
         
         pthread_mutex_lock(&mutex)
@@ -283,14 +304,8 @@ open class ClusterManager {
                 }
             }
             
-            // handle annotations on the same coordinate
-            for value in hash.values where shouldDistributeAnnotationsOnSameCoordinate && value.count > 1 {
-                for (index, node) in value.enumerated() {
-                    let distanceFromContestedLocation = 3 * Double(value.count) / 2
-                    let radiansBetweenAnnotations = (.pi * 2) / Double(value.count)
-                    let bearing = radiansBetweenAnnotations * Double(index)
-                    (node as? Annotation)?.coordinate = node.coordinate.coordinate(onBearingInRadians: bearing, atDistanceInMeters: distanceFromContestedLocation)
-                }
+            if shouldDistributeAnnotationsOnSameCoordinate {
+                distributeAnnotations(hash: hash)
             }
             
             // handle clustering
@@ -324,27 +339,25 @@ open class ClusterManager {
         
         pthread_mutex_unlock(&mutex)
         
-        let before = visibleAnnotations
-        let after = allAnnotations
-        
-        var toRemove = before.subtracted(after)
-        let toAdd = after.subtracted(before)
-        
-        if !shouldRemoveInvisibleAnnotations {
-            let nonRemoving = toRemove.filter { !visibleMapRect.contains($0.coordinate) }
-            toRemove.subtract(nonRemoving)
+        return allAnnotations
+    }
+    
+    func distributeAnnotations(hash: [CLLocationCoordinate2D: [MKAnnotation]]) {
+        // handle annotations on the same coordinate
+        for value in hash.values where value.count > 1 {
+            for (index, node) in value.enumerated() {
+                let distanceFromContestedLocation = 3 * Double(value.count) / 2
+                let radiansBetweenAnnotations = (.pi * 2) / Double(value.count)
+                let bearing = radiansBetweenAnnotations * Double(index)
+                (node as? Annotation)?.coordinate = node.coordinate.coordinate(onBearingInRadians: bearing, atDistanceInMeters: distanceFromContestedLocation)
+            }
         }
-        
-        visibleAnnotations.subtract(toRemove)
-        visibleAnnotations.add(toAdd)
-        
-        return (toAdd: toAdd, toRemove: toRemove)
     }
     
     func mapRects(zoomScale: Double, visibleMapRect: MKMapRect) -> [MKMapRect] {
         guard !zoomScale.isInfinite, !zoomScale.isNaN else { return [] }
         
-        zoomLevel = zoomScale.zoomLevel
+        let zoomLevel = zoomScale.zoomLevel
         let scaleFactor = zoomScale / cellSize(for: zoomLevel)
         
         let minX = Int(floor(visibleMapRect.minX * scaleFactor))
